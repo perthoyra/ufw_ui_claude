@@ -100,11 +100,14 @@ func New(fa fyne.App, defaultPriv ufw.Privilege) *App {
 	return a
 }
 
-// ShowAndRun displays the window, loads the firewall state and runs the event loop.
+// ShowAndRun displays the window, loads the firewall state and runs the event
+// loop. The initial load starts the elevated helper, so credentials are asked
+// for once at startup and reused until the application exits.
 func (a *App) ShowAndRun() {
 	a.win.Show()
 	a.refresh()
 	a.fa.Run()
+	a.runner.Close()
 }
 
 func (a *App) setStatus(s string) { a.statusText.SetText(s) }

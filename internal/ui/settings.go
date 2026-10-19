@@ -58,7 +58,7 @@ func newSettingsTab(a *App) *settingsTab {
 		widget.NewFormItem("Privilege escalation", priv),
 	)
 	about := widget.NewLabel(
-		"Every action runs all of its ufw commands in a single elevated shell, so you authenticate at most once per action.\n\n" +
+		"Commands run in an elevated helper shell that is started once, so you authenticate at startup and again only if the privilege mode changes or authentication is cancelled.\n\n" +
 			"Privacy: this program makes no network connections and sends no telemetry. " +
 			"Settings are stored locally by Fyne's preferences store; the command log exists only in memory.")
 	about.Wrapping = fyne.TextWrapWord

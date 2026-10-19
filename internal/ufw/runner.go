@@ -3,11 +3,14 @@
 package ufw
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -65,14 +68,19 @@ type LogEntry struct {
 	Err     error
 }
 
-// Runner executes ufw commands. All steps of a Run call are executed inside a
-// single elevated shell so the user authenticates at most once per action.
+// Runner executes ufw commands. All steps of a Run call are compiled into one
+// script. With privilege escalation the scripts are executed by a long-lived
+// elevated helper shell, so the user authenticates once, when the first
+// command runs, rather than once per action.
 type Runner struct {
 	mu        sync.Mutex
 	UfwPath   string
 	Privilege Privilege
 	DryRun    bool
 	OnLog     func(LogEntry)
+
+	sess   *session   // elevated helper; guarded by mu
+	execMu sync.Mutex // serialises requests to sess
 }
 
 // NewRunner returns a runner with sensible defaults.
@@ -92,38 +100,181 @@ func (r *Runner) Run(ctx context.Context, label string, steps ...Step) ([]Result
 	nonce := newNonce()
 	script, display := buildScript(nonce, ufwPath, dry, steps)
 
-	argv := []string{"/bin/sh", "-c", script}
+	var out string
+	var runErr error
+	if priv == PrivNone {
+		b, err := exec.CommandContext(ctx, "/bin/sh", "-c", script).CombinedOutput()
+		out = string(b)
+		if err != nil {
+			runErr = execError(err, out)
+		}
+	} else {
+		out, runErr = r.runElevated(ctx, priv, nonce, script)
+	}
+	results := parseScriptOutput(nonce, out, display)
+
+	if r.OnLog != nil {
+		r.OnLog(LogEntry{Time: time.Now(), Label: label, Results: results, Err: runErr})
+	}
+	return results, runErr
+}
+
+// execError converts a failed process into an error. The script always exits
+// 0, so a non-zero status comes from the elevation wrapper (pkexec: 126
+// dismissed, 127 not authorised) and is reported as ErrAuth.
+func execError(err error, out string) error {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return err
+	}
+	msg := strings.TrimSpace(out)
+	if msg == "" {
+		msg = ee.Error()
+	}
+	return fmt.Errorf("%w: %s", ErrAuth, msg)
+}
+
+// runElevated executes script in the elevated helper, starting it (and
+// prompting for credentials) if it is not running or the privilege changed.
+func (r *Runner) runElevated(ctx context.Context, priv Privilege, nonce, script string) (string, error) {
+	r.execMu.Lock()
+	defer r.execMu.Unlock()
+
+	r.mu.Lock()
+	if r.sess != nil && r.sess.priv != priv {
+		r.sess.close()
+		r.sess = nil
+	}
+	if r.sess == nil {
+		s, err := startSession(priv)
+		if err != nil {
+			r.mu.Unlock()
+			return "", err
+		}
+		r.sess = s
+	}
+	s := r.sess
+	r.mu.Unlock()
+
+	out, err := s.exec(ctx, nonce, script)
+	if err != nil {
+		r.mu.Lock()
+		if r.sess == s {
+			r.sess = nil
+		}
+		r.mu.Unlock()
+	}
+	return out, err
+}
+
+// Close stops the elevated helper shell, if any.
+func (r *Runner) Close() {
+	r.mu.Lock()
+	s := r.sess
+	r.sess = nil
+	r.mu.Unlock()
+	if s != nil {
+		s.close()
+	}
+}
+
+// helperScript runs as root for the lifetime of a session. It reads requests
+// of the form "<line count> <nonce>\n<script lines>" from stdin, runs each
+// script in a child shell and ends its output with a DONE marker. It exits
+// when stdin is closed, i.e. when the GUI exits.
+const helperScript = `PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+while read -r n t; do
+	s=
+	while [ "$n" -gt 0 ] && IFS= read -r l; do
+		s="$s$l
+"
+		n=$((n - 1))
+	done
+	/bin/sh -c "$s" </dev/null 2>&1
+	printf '\n@@%s:DONE@@\n' "$t"
+done
+`
+
+// session is a running elevated helper shell.
+type session struct {
+	priv      Privilege
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	out       *os.File
+	rd        *bufio.Reader
+	closeOnce sync.Once
+}
+
+func startSession(priv Privilege) (*session, error) {
+	argv := []string{"/bin/sh", "-c", helperScript}
 	switch priv {
 	case PrivPkexec:
 		argv = append([]string{"pkexec"}, argv...)
 	case PrivSudo:
 		argv = append([]string{"sudo", "-n"}, argv...)
 	}
-
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	out, err := cmd.CombinedOutput()
-	results := parseScriptOutput(nonce, string(out), display)
-
-	var runErr error
+	cmd := exec.Command(argv[0], argv[1:]...)
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			// The script always exits 0, so a non-zero status comes from the
-			// elevation wrapper (pkexec: 126 dismissed, 127 not authorised).
-			msg := strings.TrimSpace(string(out))
-			if msg == "" {
-				msg = ee.Error()
-			}
-			runErr = fmt.Errorf("%w: %s", ErrAuth, msg)
-		} else {
-			runErr = err
+		return nil, err
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		stdin.Close()
+		return nil, err
+	}
+	cmd.Stdout, cmd.Stderr = pw, pw
+	err = cmd.Start()
+	pw.Close()
+	if err != nil {
+		stdin.Close()
+		pr.Close()
+		return nil, err
+	}
+	return &session{priv: priv, cmd: cmd, stdin: stdin, out: pr, rd: bufio.NewReader(pr)}, nil
+}
+
+// exec sends script to the helper and returns its output up to the DONE
+// marker. On any failure the session is closed and must not be reused.
+func (s *session) exec(ctx context.Context, nonce, script string) (string, error) {
+	stop := context.AfterFunc(ctx, s.close)
+	defer stop()
+
+	if !strings.HasSuffix(script, "\n") {
+		script += "\n"
+	}
+	var out strings.Builder
+	_, err := fmt.Fprintf(s.stdin, "%d %s\n%s", strings.Count(script, "\n"), nonce, script)
+	done := "@@" + nonce + ":DONE@@"
+	for err == nil {
+		var line string
+		line, err = s.rd.ReadString('\n')
+		if strings.TrimSuffix(line, "\n") == done {
+			return out.String(), nil
 		}
+		out.WriteString(line)
 	}
 
-	if r.OnLog != nil {
-		r.OnLog(LogEntry{Time: time.Now(), Label: label, Results: results, Err: runErr})
+	s.close()
+	if ctx.Err() != nil {
+		return out.String(), ctx.Err()
 	}
-	return results, runErr
+	// The helper exited before finishing: either elevation failed or was
+	// cancelled (pkexec/sudo print the reason), or the helper was killed.
+	msg := strings.TrimSpace(out.String())
+	if msg == "" {
+		msg = "the elevated helper exited"
+	}
+	return out.String(), fmt.Errorf("%w: %s", ErrAuth, msg)
+}
+
+func (s *session) close() {
+	s.closeOnce.Do(func() {
+		s.stdin.Close()
+		s.out.Close()
+		_ = s.cmd.Process.Kill() // fails once elevated; closing stdin ends the helper
+		go s.cmd.Wait()
+	})
 }
 
 // SetConfig updates runner settings safely.

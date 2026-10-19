@@ -29,7 +29,7 @@ var placementNames = []string{"Append (end of list)", "Insert at position", "Pre
 const (
 	syntaxSimple = "Simple"
 	syntaxFull   = "Full"
-	kindNone     = "—"
+	kindNone     = "any port"
 	kindPort     = "port"
 	kindApp      = "app"
 	logNone      = "none"
@@ -47,6 +47,7 @@ type ruleForm struct {
 	action, direction, log *widget.Select
 	iface, ifaceIn, ifOut  *widget.Entry
 	target                 *widget.SelectEntry
+	anyPort                *widget.Check
 	proto                  *widget.Select
 	fromAddr, toAddr       *widget.Entry
 	fromKind, toKind       *widget.Select
@@ -78,6 +79,7 @@ func showRuleDialog(a *App, place placement, editing *ufw.Rule, target string) *
 	f.target = widget.NewSelectEntry(apps)
 	f.target.PlaceHolder = "22, 22/tcp, 6000:6007/tcp, 80,443/tcp or application name"
 	f.target.OnChanged = func(string) { f.updatePreview() }
+	f.anyPort = widget.NewCheck("Any port", func(bool) { f.layout() })
 	f.proto = widget.NewSelect(ufw.Protocols, func(string) { f.updatePreview() })
 	f.fromAddr = f.entry("any, 192.168.0.0/24, 2001:db8::/32")
 	f.toAddr = f.entry("any, 10.0.0.1")
@@ -132,7 +134,7 @@ func showRuleDialog(a *App, place placement, editing *ufw.Rule, target string) *
 	row(&f.routeRows, "In on", f.ifaceIn)
 	row(&f.routeRows, "Out on", f.ifOut)
 	row(&common, "Logging", f.log)
-	row(&f.simpleRows, "Port / app", f.target)
+	row(&f.simpleRows, "Port / app", container.NewBorder(nil, nil, nil, f.anyPort, f.target))
 	row(&f.fullRows, "Protocol", f.proto)
 	row(&f.fullRows, "From address", f.fromAddr)
 	row(&f.fullRows, "From", container.NewBorder(nil, nil, f.fromKind, nil, f.fromVal))
@@ -248,6 +250,11 @@ func (f *ruleForm) layout() {
 	setVisible(f.routeRows, full && f.route.Checked)
 	setVisible(f.plainRows, !(full && f.route.Checked))
 	setVisible(f.posRow, f.placeSel.Selected == placementNames[placeInsert])
+	if f.anyPort.Checked {
+		f.target.Disable()
+	} else {
+		f.target.Enable()
+	}
 	if f.fromKind.Selected == kindNone {
 		f.fromVal.Hide()
 	} else {
@@ -296,7 +303,11 @@ func (f *ruleForm) args() ([]string, error) {
 	if l := f.log.Selected; l != "" && l != logNone {
 		a = append(a, l)
 	}
-	if !full {
+	if !full && f.anyPort.Checked {
+		// ufw has no simple syntax for "every port"; omitting the port in
+		// full syntax matches all ports and protocols.
+		a = append(a, "from", "any", "to", "any")
+	} else if !full {
 		tgt := strings.TrimSpace(f.target.Text)
 		if tgt == "" {
 			return nil, errors.New("enter a port (e.g. 22/tcp) or an application name")

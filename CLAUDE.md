@@ -23,7 +23,7 @@ The UI test (`internal/ui/ui_test.go`) is headless through `fyne.io/fyne/v2/test
 
 ## Architecture
 
-This repo is split into three layers: `main` bootstraps the app, `internal/ufw` owns the firewall execution/parsing logic, and `internal/ui` owns the Fyne UI and tab state. `main.go` creates the Fyne app (`app.NewWithID("local.ufwgui")`), picks `PrivNone` when the process runs as root (`os.Geteuid() == 0`) and otherwise `PrivPkexec`, then calls `ui.New(a, priv).ShowAndRun()`. A privilege stored in Preferences overrides that default.
+This repo is split into three layers: `main` bootstraps the app, `internal/ufw` owns the firewall execution/parsing logic, and `internal/ui` owns the Fyne UI and tab state. `main.go` creates the Fyne app (`app.NewWithID("local.ufwgui")`), picks `PrivNone` when the process runs as root (`os.Geteuid() == 0`) and otherwise `PrivPkexec`, then calls `ui.New(a, priv).ShowAndRun()`, which closes the runner's elevated helper when the event loop exits. A privilege stored in Preferences overrides that default.
 
 Package import diagram (internal packages and direct external imports):
 
@@ -45,7 +45,7 @@ graph TD
 | File | Contents |
 |---|---|
 | `main.go` | Entry point, default privilege selection |
-| `internal/ufw/runner.go` | `Privilege`, `Step`, `Cond`, `Result`, `LogEntry`, `Runner`, `ErrAuth`, `ShellQuote`, `CommandString`, script build/parse |
+| `internal/ufw/runner.go` | `Privilege`, `Step`, `Cond`, `Result`, `LogEntry`, `Runner`, `ErrAuth`, `ShellQuote`, `CommandString`, script build/parse, elevated helper `session` |
 | `internal/ufw/ops.go` | Allowed values (`Actions`, `Policies`, `PolicyDirs`, `AppPolicies`, `LogLevels`, `RuleLogOptions`, `Protocols`, `Reports`), `StepsDeleteNumber`, `StepsMove`, `StepsReplace`, `SnapshotSteps`, `ErrNotMovable` |
 | `internal/ufw/snapshot.go` | `Snapshot`, `AppProfile`, `ParseSnapshot`, `ParseAppList`, `ParseAppInfo`, `ListeningEntry`, `ParseListening`, `ParseAdded` |
 | `internal/ufw/rules.go` | `Tuple`, `ParseTuples`/`ParseTuple`, `Tuple.Args`, `Rule`, `ParseNumbered`, `MergeRules` |
@@ -63,7 +63,7 @@ graph TD
 
 ### `internal/ufw` — command execution and parsing (no UI)
 
-- **Runner (`runner.go`)**: every user action is a `Run(ctx, label, steps...)` call. All `Step`s from one call are compiled into a single `/bin/sh -c` script wrapped by `pkexec` (`PrivPkexec`), `sudo -n` (`PrivSudo`), or nothing (`PrivNone`), so the user authenticates at most once per action. The script forces `LC_ALL=C` and a sane `PATH` so output is parseable. Each step's output is bracketed by nonce markers (`@@<nonce>:BEGIN:i@@` / `END:i:<code>`) and parsed back into per-step `Result`s; steps that did not run have `Skipped=true, ExitCode=-1`. The script always exits 0, so a non-zero process exit means the elevation wrapper failed and should be treated as `ErrAuth`.
+- **Runner (`runner.go`)**: every user action is a `Run(ctx, label, steps...)` call. All `Step`s from one call are compiled into a single `/bin/sh` script. With `PrivNone` it runs directly via `/bin/sh -c`. With `PrivPkexec`/`PrivSudo`, the first `Run` starts a long-lived elevated helper (`session`, `helperScript`) wrapped by `pkexec` or `sudo -n`. The helper reads `<line count> <nonce>` + script lines from stdin, runs each script in a child shell, and terminates its output with `@@<nonce>:DONE@@`. The user therefore authenticates once, during the startup refresh, and requests to the helper are serialised (`execMu`). The helper is restarted (re-prompting) only if the privilege mode changes or the session fails (auth cancelled, helper exited, or context timeout); `Runner.Close` stops it and is called when the app exits. The script forces `LC_ALL=C` and a sane `PATH` so output is parseable. Each step's output is bracketed by nonce markers (`@@<nonce>:BEGIN:i@@` / `END:i:<code>`) and parsed back into per-step `Result`s; steps that did not run have `Skipped=true, ExitCode=-1`. The script always exits 0, so a non-zero process exit, or the helper exiting before the DONE marker, means the elevation wrapper failed and is reported as `ErrAuth`.
   - `UfwPath`, `Privilege`, and `DryRun` are guarded by a mutex: change them via `SetConfig` and read dry-run via `IsDryRun`.
   - `Ufw(mutating, args...)` is the helper for building ufw steps.
   - `Step.Mutating` controls whether `--dry-run` is prepended when dry-run mode is enabled; read-only commands must set this to `false`. `--dry-run` is only ever applied to ufw steps (`Prog == ""`).
