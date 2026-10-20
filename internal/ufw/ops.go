@@ -90,6 +90,32 @@ func stepsMoveReplace(rules []Rule, from, to int, newArgs []string) ([]Step, err
 	return steps, nil
 }
 
+// IPv6RulesBackup holds user6.rules while IPv6 is disabled. With IPV6=no ufw
+// does not read user6.rules but still rewrites it (empty) on every reload or
+// enable, which would otherwise delete all IPv6 rules.
+const IPv6RulesBackup = "/etc/ufw/user6.rules.ufwgui-ipv6off"
+
+// StepsSetIPv6 sets IPV6=yes|no in /etc/default/ufw and reloads ufw. ufw has
+// no command for this setting. Turning IPv6 off first saves user6.rules to
+// IPv6RulesBackup; turning it on restores that file (if present) before the
+// reload. The non-ufw steps are not covered by --dry-run, so callers must not
+// run these steps in dry-run mode.
+func StepsSetIPv6(on bool) []Step {
+	const conf, rules6 = "/etc/default/ufw", "/etc/ufw/user6.rules"
+	sed := func(v string) Step {
+		return Step{Prog: "sed", Args: []string{"-i", "s/^IPV6=.*/IPV6=" + v + "/", conf}, Mutating: true}
+	}
+	if !on {
+		backup := Step{Prog: "cp", Args: []string{"-p", rules6, IPv6RulesBackup}, Mutating: true}
+		edit := sed("no")
+		edit.RunIf = &Cond{Step: 0, OK: true}
+		return []Step{backup, edit, {Args: []string{"reload"}, Mutating: true, RunIf: &Cond{Step: 1, OK: true}}}
+	}
+	restore := Step{Prog: "sh", Args: []string{"-c", `[ ! -f "$1" ] || mv -f "$1" "$2"`, "sh", IPv6RulesBackup, rules6}, Mutating: true}
+	restore.RunIf = &Cond{Step: 0, OK: true}
+	return []Step{sed("yes"), restore, {Args: []string{"reload"}, Mutating: true, RunIf: &Cond{Step: 1, OK: true}}}
+}
+
 // SnapshotSteps returns the commands that collect the full firewall state.
 func SnapshotSteps() []Step {
 	return []Step{

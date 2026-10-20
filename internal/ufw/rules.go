@@ -99,6 +99,32 @@ func ParseTuple(s string, v6 bool) (Tuple, error) {
 	return t, nil
 }
 
+// appKey mirrors ufw's get_app_tuple: ufw stores an application rule as one
+// tuple per protocol but numbers and displays it once. Empty for non-app rules.
+func (t Tuple) appKey() string {
+	if t.DApp == "" && t.SApp == "" {
+		return ""
+	}
+	dst, src := t.DApp, t.SApp
+	if t.DApp == "" {
+		dst = t.DPort
+	}
+	if t.SApp == "" {
+		src = t.SPort
+	}
+	k := dst + " " + t.Dst + " " + src + " " + t.Src
+	if t.IfaceIn == "" && t.IfaceOut == "" {
+		return k + " " + t.Direction
+	}
+	if t.IfaceIn != "" {
+		k += " in_" + t.IfaceIn
+	}
+	if t.IfaceOut != "" {
+		k += " out_" + t.IfaceOut
+	}
+	return k
+}
+
 func decodeApp(s string) string {
 	if s == "-" {
 		return ""
@@ -258,8 +284,9 @@ func ParseNumbered(out string) []Rule {
 }
 
 // MergeRules combines tuples (authoritative order) with numbered status output
-// (ufw's own display strings). When tuples are unavailable the status output is
-// used alone.
+// (ufw's own display strings). Application tuples sharing an app key count as
+// one rule, as in ufw. When tuples are unavailable the status output is used
+// alone.
 func MergeRules(v4, v6 []Tuple, tuplesOK bool, numbered []Rule) []Rule {
 	if !tuplesOK {
 		return numbered
@@ -270,9 +297,16 @@ func MergeRules(v4, v6 []Tuple, tuplesOK bool, numbered []Rule) []Rule {
 	}
 	all := append(append([]Tuple{}, v4...), v6...)
 	rules := make([]Rule, 0, len(all))
+	seenApp := map[string]bool{}
 	for i := range all {
 		t := all[i]
-		r := Rule{Number: i + 1, V6: t.V6, Tuple: &t, Comment: t.Comment}
+		if k := t.appKey(); k != "" {
+			if seenApp[k] {
+				continue
+			}
+			seenApp[k] = true
+		}
+		r := Rule{Number: len(rules) + 1, V6: t.V6, Tuple: &t, Comment: t.Comment}
 		if s, ok := byNum[r.Number]; ok && s.V6 == t.V6 {
 			r.To, r.Action, r.From = s.To, s.Action, s.From
 		} else {

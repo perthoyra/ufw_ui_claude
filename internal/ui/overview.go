@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"strings"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
@@ -17,6 +19,7 @@ type overviewTab struct {
 	state      *widget.Label
 	version    *widget.Label
 	ipv6       *widget.Label
+	ipv6Btn    *widget.Button
 	routedNote *widget.Label
 	enableBtn  *widget.Button
 	disableBtn *widget.Button
@@ -43,6 +46,37 @@ func newOverviewTab(a *App) *overviewTab {
 			a.run("ufw disable", []ufw.Step{ufw.Ufw(true, "disable")}, true, nil)
 		})
 	})
+	t.ipv6Btn = widget.NewButton("Enable IPv6", func() {
+		on := a.snap == nil || a.snap.IPv6 != "yes"
+		steps := ufw.StepsSetIPv6(on)
+		v := "no"
+		if on {
+			v = "yes"
+		}
+		label := "set IPV6=" + v
+		if a.runner.IsDryRun() {
+			// sed has no dry-run mode; show what would run instead
+			var cmds []string
+			for _, st := range steps {
+				prog := st.Prog
+				if prog == "" {
+					prog = "ufw"
+				}
+				cmds = append(cmds, ufw.CommandString(prog, st.Args))
+			}
+			a.showText("Dry run: "+label, "Dry-run mode is on, nothing was changed. Would run:\n\n"+strings.Join(cmds, "\n"))
+			return
+		}
+		msg := "Set IPV6=" + v + " in /etc/default/ufw and reload ufw?"
+		if on {
+			msg += "\n\nIPv6 rules saved in " + ufw.IPv6RulesBackup + " (if present) are restored first."
+		} else {
+			msg += "\n\nThe IPv6 rules are saved to " + ufw.IPv6RulesBackup + " and restored when IPv6 is enabled here again.\nufw empties user6.rules while IPv6 is off, so enable IPv6 from this app to get them back."
+		}
+		a.confirm("IPv6", msg, func() {
+			a.run(label, steps, true, nil)
+		})
+	})
 	reload := widget.NewButtonWithIcon("Reload", theme.ViewRefreshIcon(), func() {
 		a.run("ufw reload", []ufw.Step{ufw.Ufw(true, "reload")}, true, nil)
 	})
@@ -58,7 +92,7 @@ func newOverviewTab(a *App) *overviewTab {
 			container.NewHBox(widget.NewLabel("Status:"), t.state),
 			container.NewHBox(t.enableBtn, t.disableBtn, reload, reset),
 			container.NewHBox(widget.NewLabel("Version:"), t.version),
-			container.NewHBox(widget.NewLabel("IPv6 (/etc/default/ufw):"), t.ipv6),
+			container.NewHBox(widget.NewLabel("IPv6 (/etc/default/ufw):"), t.ipv6, t.ipv6Btn),
 		))
 
 	form := container.New(layout.NewFormLayout())
@@ -120,6 +154,11 @@ func (t *overviewTab) update(s *ufw.Snapshot) {
 	t.state.Refresh()
 	t.version.SetText(s.Version)
 	t.ipv6.SetText(s.IPv6)
+	if s.IPv6 == "yes" {
+		t.ipv6Btn.SetText("Disable IPv6")
+	} else {
+		t.ipv6Btn.SetText("Enable IPv6")
+	}
 	setSelect(t.policy["incoming"], s.DefaultIncoming)
 	setSelect(t.policy["outgoing"], s.DefaultOutgoing)
 	setSelect(t.policy["routed"], s.DefaultRouted)

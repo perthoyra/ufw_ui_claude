@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`ufwgui` is a Fyne desktop GUI for the Linux `ufw` firewall. It runs as a local application, shells out to `ufw`, `cat`, and `sh` via privilege escalation when needed, and makes no outbound network connections. Settings are stored in Fyne `Preferences` (app ID `local.ufwgui`); the command log exists only in memory.
+`ufwgui` is a Fyne desktop GUI for the Linux `ufw` firewall. It runs as a local application, shells out to `ufw`, `cat`, `sed`, `cp`, and `sh` via privilege escalation when needed, and makes no outbound network connections. Settings are stored in Fyne `Preferences` (app ID `local.ufwgui`); the command log exists only in memory.
 
 The module name is `ufwgui` and the repo root is the Go module root. The project targets Go 1.27.2 as declared in `go.mod` and depends on Fyne v2.8.2 (the only direct dependency). If the installed Go is older, `GOTOOLCHAIN=auto` will fetch the required toolchain automatically. Keep indirect dependencies aligned with what Fyne requires; do not run `go get -u ./...` unless explicitly requested.
 
@@ -35,7 +35,7 @@ graph TD
     B --> C
     B --> E[fyne.io/fyne/v2<br/>container, dialog, layout, theme, widget]
     B -. tests .-> F[fyne.io/fyne/v2/test]
-    C --> G[os/exec → pkexec / sudo -n / sh]
+    C --> G[os/exec → pkexec / sudo -n / sh → ufw, cat, sed, cp]
 ```
 
 `internal/ufw` imports only the standard library and must stay free of UI code. `internal/ui` is the only package that depends on `internal/ufw` types besides `main`.
@@ -46,12 +46,12 @@ graph TD
 |---|---|
 | `main.go` | Entry point, default privilege selection |
 | `internal/ufw/runner.go` | `Privilege`, `Step`, `Cond`, `Result`, `LogEntry`, `Runner`, `ErrAuth`, `ShellQuote`, `CommandString`, script build/parse, elevated helper `session` |
-| `internal/ufw/ops.go` | Allowed values (`Actions`, `Policies`, `PolicyDirs`, `AppPolicies`, `LogLevels`, `RuleLogOptions`, `Protocols`, `Reports`), `StepsDeleteNumber`, `StepsMove`, `StepsReplace`, `SnapshotSteps`, `ErrNotMovable` |
+| `internal/ufw/ops.go` | Allowed values (`Actions`, `Policies`, `PolicyDirs`, `AppPolicies`, `LogLevels`, `RuleLogOptions`, `Protocols`, `Reports`), `StepsDeleteNumber`, `StepsMove`, `StepsReplace`, `StepsSetIPv6`, `IPv6RulesBackup`, `SnapshotSteps`, `ErrNotMovable` |
 | `internal/ufw/snapshot.go` | `Snapshot`, `AppProfile`, `ParseSnapshot`, `ParseAppList`, `ParseAppInfo`, `ListeningEntry`, `ParseListening`, `ParseAdded` |
 | `internal/ufw/rules.go` | `Tuple`, `ParseTuples`/`ParseTuple`, `Tuple.Args`, `Rule`, `ParseNumbered`, `MergeRules` |
 | `internal/ufw/ufw_test.go` | Tuple/numbered parsing, `Args`, `StepsMove`, script round-trip, app/report parsers |
 | `internal/ui/app.go` | `App`, preference keys, `run`, `reportResult`, `refresh`, shared dialog helpers (`showOutput`, `showText`, `confirm`, `monoLabel`) |
-| `internal/ui/overview.go` | `overviewTab` ("Status & Policies"): enable/disable/reload/reset, default policies, logging |
+| `internal/ui/overview.go` | `overviewTab` ("Status & Policies"): enable/disable/reload/reset, IPv6 on/off, default policies, logging |
 | `internal/ui/rules.go` | `rulesTab`: rule table, add/insert/prepend/edit/delete, move top/up/down/bottom/to |
 | `internal/ui/ruledialog.go` | `ruleForm` rule builder (`showRuleDialog`), `placement` enum, `showForm` |
 | `internal/ui/apps.go` | `appsTab` ("Application Profiles"): quick rules, app info/update, app default policy |
@@ -68,14 +68,15 @@ graph TD
   - `Ufw(mutating, args...)` is the helper for building ufw steps.
   - `Step.Mutating` controls whether `--dry-run` is prepended when dry-run mode is enabled; read-only commands must set this to `false`. `--dry-run` is only ever applied to ufw steps (`Prog == ""`).
   - `Step.RunIf` (`Cond`) makes a step conditional on an earlier step's success (`OK: true`) or on it having run and failed (`OK: false`) in the same script; this is how rollback is handled.
-  - `Step.Prog` is empty when the command should target the configured `ufw` path; otherwise it can point to another program such as `cat` when reading files.
+  - `Step.Prog` is empty when the command should target the configured `ufw` path; otherwise it can point to another program such as `cat` when reading files or `sed` when editing `/etc/default/ufw`. Non-ufw steps are never dry-run, so the UI must not run a mutating non-ufw step while dry-run is on.
   - Arguments are quoted with `ShellQuote`; never build shell strings by hand. `CommandString` renders a display command line (ufw steps are shown as `ufw …` regardless of the configured path).
   - `OnLog` is called after every `Run` with a `LogEntry`; it runs on the calling goroutine.
 - **Snapshot (`snapshot.go`, `ops.go:SnapshotSteps`)**: a refresh runs a fixed sequence of steps; `ParseSnapshot` reads results by index:
   `0` version · `1` status verbose · `2` status numbered · `3` `cat /etc/ufw/user.rules` · `4` `cat /etc/ufw/user6.rules` · `5` `cat /etc/default/ufw` · `6` `cat /etc/ufw/ufw.conf` · `7` app list · `8` app info all.
   Changing `SnapshotSteps` requires updating these indexes in `ParseSnapshot`. Values from the config files (`/etc/default/ufw`, `ufw.conf`) override what `status verbose` reports. Non-fatal problems are added to `Snapshot.Warnings` and surfaced through the Warnings button.
 - **Report parsers (`snapshot.go`)**: `ParseListening` and `ParseAdded` are not part of the snapshot; they are used on demand by the Reports tab.
-- **Rules (`rules.go`)**: `Tuple` is parsed from `### tuple ###` lines in the user rules files and is the authoritative rule definition (comments are hex-encoded there). `Tuple.Args()` regenerates full-syntax `ufw` CLI arguments with explicit addresses so a rule stays in its IP family. `Rule` is one numbered rule; `Rule.Tuple` is nil when the rule files were unreadable. `MergeRules` keeps tuple order (all IPv4, then all IPv6) as the numbering and uses display strings from `ufw status numbered` when number and family line up, otherwise synthesizes them. If the rule files cannot be read (`TuplesOK=false`), rules come from status output alone and move/edit is disabled.
+- **Rules (`rules.go`)**: `Tuple` is parsed from `### tuple ###` lines in the user rules files and is the authoritative rule definition (comments are hex-encoded there). `Tuple.Args()` regenerates full-syntax `ufw` CLI arguments with explicit addresses so a rule stays in its IP family. `Rule` is one numbered rule; `Rule.Tuple` is nil when the rule files were unreadable. `MergeRules` keeps tuple order (all IPv4, then all IPv6) as the numbering, counting application tuples that share ufw's app key (`Tuple.appKey`, mirroring ufw's `get_app_tuple`) as one rule, and uses display strings from `ufw status numbered` when number and family line up, otherwise synthesizes them. If the rule files cannot be read (`TuplesOK=false`), rules come from status output alone and move/edit is disabled.
+- **IPv6 (`ops.go:StepsSetIPv6`)**: ufw has no command for `IPV6=`; `StepsSetIPv6` rewrites it in `/etc/default/ufw` with `sed -i` and runs `ufw reload` only if the earlier steps succeeded. With `IPV6=no`, ufw still rewrites `user6.rules` (empty) on every reload/enable, so turning IPv6 off first copies `user6.rules` to `IPv6RulesBackup`, and turning it on moves that file back (if present) before the reload. When `IPV6=no`, `ParseSnapshot` ignores `user6.rules`, as ufw does.
 - **Move/edit (`ops.go`)**: `ufw` has no move command. `StepsMove` and `StepsReplace` (both via `stepsMoveReplace`) emit `--force delete N`, then `insert M <args>` (or plain append when `M` is the family's last position) only if the delete succeeded, then reinsert the original at `N` only if the insert failed. Moves are restricted to the rule's own IP family (`familyBounds`).
 
 ### `internal/ui` — Fyne UI

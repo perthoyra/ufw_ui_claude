@@ -86,23 +86,23 @@ func ParseSnapshot(res []Result) *Snapshot {
 	if v4ok {
 		var errs []error
 		v4, errs = ParseTuples(v4Out, false)
+		// ufw ignores user6.rules when IPv6 is disabled
+		if v6ok && s.IPv6 != "no" {
+			var errs6 []error
+			v6, errs6 = ParseTuples(v6Out, true)
+			errs = append(errs, errs6...)
+		}
 		for _, e := range errs {
 			s.Warnings = append(s.Warnings, e.Error())
-		}
-		if v6ok {
-			v6, errs = ParseTuples(v6Out, true)
-			for _, e := range errs {
-				s.Warnings = append(s.Warnings, e.Error())
-			}
 		}
 		s.TuplesOK = len(errs) == 0
 	} else {
 		warn(3, "reading /etc/ufw/user.rules (rule moving/editing disabled)")
 	}
-	if s.TuplesOK && s.Active && len(numbered) != len(v4)+len(v6) {
+	s.Rules = MergeRules(v4, v6, s.TuplesOK, numbered)
+	if s.TuplesOK && s.Active && len(numbered) != len(s.Rules) {
 		s.Warnings = append(s.Warnings, "rule files and 'ufw status numbered' disagree; showing rule files")
 	}
-	s.Rules = MergeRules(v4, v6, s.TuplesOK, numbered)
 
 	if out, ok := get(7); ok {
 		for _, name := range ParseAppList(out) {
